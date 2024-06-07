@@ -27,7 +27,6 @@
 
 #include "config.h"
 
-#include <assert.h>
 #include <string.h>
 
 #include "common/intops.h"
@@ -44,8 +43,8 @@ static void decomp_tx(uint8_t (*const txa)[2 /* txsz, step */][32 /* y */][32 /*
                       const uint16_t *const tx_masks)
 {
     const TxfmInfo *const t_dim = &dav1d_txfm_dimensions[from];
-    const int is_split =
-        depth > 1 ? 0 : (tx_masks[depth] >> (y_off * 4 + x_off)) & 1;
+    const int is_split = (from == (int) TX_4X4 || depth > 1) ? 0 :
+        (tx_masks[depth] >> (y_off * 4 + x_off)) & 1;
 
     if (is_split) {
         const enum RectTxfmSize sub = t_dim->sub;
@@ -90,7 +89,7 @@ static inline void mask_edges_inter(uint16_t (*const masks)[32][3][2],
     const TxfmInfo *const t_dim = &dav1d_txfm_dimensions[max_tx];
     int y, x;
 
-    uint8_t txa[2 /* edge */][2 /* txsz, step */][32 /* y */][32 /* x */];
+    ALIGN_STK_16(uint8_t, txa, 2 /* edge */, [2 /* txsz, step */][32 /* y */][32 /* x */]);
     for (int y_off = 0, y = 0; y < h4; y += t_dim->h, y_off++)
         for (int x_off = 0, x = 0; x < w4; x += t_dim->w, x_off++)
             decomp_tx((uint8_t(*)[2][32][32]) &txa[0][0][y][x],
@@ -213,13 +212,13 @@ static inline void mask_edges_intra(uint16_t (*const masks)[32][3][2],
 #undef set_ctx
 }
 
-static inline void mask_edges_chroma(uint16_t (*const masks)[32][2][2],
-                                     const int cby4, const int cbx4,
-                                     const int cw4, const int ch4,
-                                     const int skip_inter,
-                                     const enum RectTxfmSize tx,
-                                     uint8_t *const a, uint8_t *const l,
-                                     const int ss_hor, const int ss_ver)
+static void mask_edges_chroma(uint16_t (*const masks)[32][2][2],
+                              const int cby4, const int cbx4,
+                              const int cw4, const int ch4,
+                              const int skip_inter,
+                              const enum RectTxfmSize tx,
+                              uint8_t *const a, uint8_t *const l,
+                              const int ss_hor, const int ss_ver)
 {
     const TxfmInfo *const t_dim = &dav1d_txfm_dimensions[tx];
     const int twl4 = t_dim->lw, thl4 = t_dim->lh;
@@ -287,7 +286,6 @@ static inline void mask_edges_chroma(uint16_t (*const masks)[32][2][2],
 void dav1d_create_lf_mask_intra(Av1Filter *const lflvl,
                                 uint8_t (*const level_cache)[4],
                                 const ptrdiff_t b4_stride,
-                                const Dav1dFrameHeader *const hdr,
                                 const uint8_t (*filter_level)[8][2],
                                 const int bx, const int by,
                                 const int iw, const int ih,
@@ -298,14 +296,12 @@ void dav1d_create_lf_mask_intra(Av1Filter *const lflvl,
                                 uint8_t *const ay, uint8_t *const ly,
                                 uint8_t *const auv, uint8_t *const luv)
 {
-    if (!hdr->loopfilter.level_y[0] && !hdr->loopfilter.level_y[1])
-        return;
-
     const uint8_t *const b_dim = dav1d_block_dimensions[bs];
     const int bw4 = imin(iw - bx, b_dim[0]);
     const int bh4 = imin(ih - by, b_dim[1]);
     const int bx4 = bx & 31;
     const int by4 = by & 31;
+    assert(bw4 >= 0 && bh4 >= 0);
 
     if (bw4 && bh4) {
         uint8_t (*level_cache_ptr)[4] = level_cache + by * b4_stride + bx;
@@ -328,6 +324,7 @@ void dav1d_create_lf_mask_intra(Av1Filter *const lflvl,
                           (b_dim[0] + ss_hor) >> ss_hor);
     const int cbh4 = imin(((ih + ss_ver) >> ss_ver) - (by >> ss_ver),
                           (b_dim[1] + ss_ver) >> ss_ver);
+    assert(cbw4 >= 0 && cbh4 >= 0);
 
     if (!cbw4 || !cbh4) return;
 
@@ -351,25 +348,23 @@ void dav1d_create_lf_mask_intra(Av1Filter *const lflvl,
 void dav1d_create_lf_mask_inter(Av1Filter *const lflvl,
                                 uint8_t (*const level_cache)[4],
                                 const ptrdiff_t b4_stride,
-                                const Dav1dFrameHeader *const hdr,
                                 const uint8_t (*filter_level)[8][2],
                                 const int bx, const int by,
                                 const int iw, const int ih,
                                 const int skip, const enum BlockSize bs,
+                                const enum RectTxfmSize max_ytx,
                                 const uint16_t *const tx_masks,
                                 const enum RectTxfmSize uvtx,
                                 const enum Dav1dPixelLayout layout,
                                 uint8_t *const ay, uint8_t *const ly,
                                 uint8_t *const auv, uint8_t *const luv)
 {
-    if (!hdr->loopfilter.level_y[0] && !hdr->loopfilter.level_y[1])
-        return;
-
     const uint8_t *const b_dim = dav1d_block_dimensions[bs];
     const int bw4 = imin(iw - bx, b_dim[0]);
     const int bh4 = imin(ih - by, b_dim[1]);
     const int bx4 = bx & 31;
     const int by4 = by & 31;
+    assert(bw4 >= 0 && bh4 >= 0);
 
     if (bw4 && bh4) {
         uint8_t (*level_cache_ptr)[4] = level_cache + by * b4_stride + bx;
@@ -382,7 +377,7 @@ void dav1d_create_lf_mask_inter(Av1Filter *const lflvl,
         }
 
         mask_edges_inter(lflvl->filter_y, by4, bx4, bw4, bh4, skip,
-                         dav1d_max_txfm_size_for_bs[bs][0], tx_masks, ay, ly);
+                         max_ytx, tx_masks, ay, ly);
     }
 
     if (!auv) return;
@@ -393,6 +388,7 @@ void dav1d_create_lf_mask_inter(Av1Filter *const lflvl,
                           (b_dim[0] + ss_hor) >> ss_hor);
     const int cbh4 = imin(((ih + ss_ver) >> ss_ver) - (by >> ss_ver),
                           (b_dim[1] + ss_ver) >> ss_ver);
+    assert(cbw4 >= 0 && cbh4 >= 0);
 
     if (!cbw4 || !cbh4) return;
 
@@ -432,17 +428,15 @@ void dav1d_calc_eih(Av1FilterLUT *const lim_lut, const int filter_sharpness) {
     lim_lut->sharp[1] = sharp ? 9 - sharp : 0xff;
 }
 
-static inline void calc_lf_value(uint8_t (*const lflvl_values)[2],
-                                 const int is_chroma, const int base_lvl,
-                                 const int lf_delta, const int seg_delta,
-                                 const Dav1dLoopfilterModeRefDeltas *const mr_delta)
+static void calc_lf_value(uint8_t (*const lflvl_values)[2],
+                          const int base_lvl, const int lf_delta,
+                          const int seg_delta,
+                          const Dav1dLoopfilterModeRefDeltas *const mr_delta)
 {
     const int base = iclip(iclip(base_lvl + lf_delta, 0, 63) + seg_delta, 0, 63);
 
-    if (!base_lvl && is_chroma) {
-        memset(lflvl_values, 0, 8 * 2);
-    } else if (!mr_delta) {
-        memset(lflvl_values, base, 8 * 2);
+    if (!mr_delta) {
+        memset(lflvl_values, base, sizeof(*lflvl_values) * 8);
     } else {
         const int sh = base >= 32;
         lflvl_values[0][0] = lflvl_values[0][1] =
@@ -457,6 +451,17 @@ static inline void calc_lf_value(uint8_t (*const lflvl_values)[2],
     }
 }
 
+static inline void calc_lf_value_chroma(uint8_t (*const lflvl_values)[2],
+                                        const int base_lvl, const int lf_delta,
+                                        const int seg_delta,
+                                        const Dav1dLoopfilterModeRefDeltas *const mr_delta)
+{
+    if (!base_lvl)
+        memset(lflvl_values, 0, sizeof(*lflvl_values) * 8);
+    else
+        calc_lf_value(lflvl_values, base_lvl, lf_delta, seg_delta, mr_delta);
+}
+
 void dav1d_calc_lf_values(uint8_t (*const lflvl_values)[4][8][2],
                           const Dav1dFrameHeader *const hdr,
                           const int8_t lf_delta[4])
@@ -464,7 +469,7 @@ void dav1d_calc_lf_values(uint8_t (*const lflvl_values)[4][8][2],
     const int n_seg = hdr->segmentation.enabled ? 8 : 1;
 
     if (!hdr->loopfilter.level_y[0] && !hdr->loopfilter.level_y[1]) {
-        memset(lflvl_values, 0, 8 * 4 * 2 * n_seg);
+        memset(lflvl_values, 0, sizeof(*lflvl_values) * n_seg);
         return;
     }
 
@@ -475,16 +480,16 @@ void dav1d_calc_lf_values(uint8_t (*const lflvl_values)[4][8][2],
         const Dav1dSegmentationData *const segd =
             hdr->segmentation.enabled ? &hdr->segmentation.seg_data.d[s] : NULL;
 
-        calc_lf_value(lflvl_values[s][0], 0, hdr->loopfilter.level_y[0],
+        calc_lf_value(lflvl_values[s][0], hdr->loopfilter.level_y[0],
                       lf_delta[0], segd ? segd->delta_lf_y_v : 0, mr_deltas);
-        calc_lf_value(lflvl_values[s][1], 0, hdr->loopfilter.level_y[1],
+        calc_lf_value(lflvl_values[s][1], hdr->loopfilter.level_y[1],
                       lf_delta[hdr->delta.lf.multi ? 1 : 0],
                       segd ? segd->delta_lf_y_h : 0, mr_deltas);
-        calc_lf_value(lflvl_values[s][2], 1, hdr->loopfilter.level_u,
-                      lf_delta[hdr->delta.lf.multi ? 2 : 0],
-                      segd ? segd->delta_lf_u : 0, mr_deltas);
-        calc_lf_value(lflvl_values[s][3], 1, hdr->loopfilter.level_v,
-                      lf_delta[hdr->delta.lf.multi ? 3 : 0],
-                      segd ? segd->delta_lf_v : 0, mr_deltas);
+        calc_lf_value_chroma(lflvl_values[s][2], hdr->loopfilter.level_u,
+                             lf_delta[hdr->delta.lf.multi ? 2 : 0],
+                             segd ? segd->delta_lf_u : 0, mr_deltas);
+        calc_lf_value_chroma(lflvl_values[s][3], hdr->loopfilter.level_v,
+                             lf_delta[hdr->delta.lf.multi ? 3 : 0],
+                             segd ? segd->delta_lf_v : 0, mr_deltas);
     }
 }

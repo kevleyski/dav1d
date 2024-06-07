@@ -1,5 +1,5 @@
 /*
- * Copyright © 2018, VideoLAN and dav1d authors
+ * Copyright © 2018-2020, VideoLAN and dav1d authors
  * Copyright © 2018, Two Orioles, LLC
  * All rights reserved.
  *
@@ -34,10 +34,14 @@
 #include "common.h"
 #include "headers.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Number of bytes to align AND pad picture memory buffers by, so that SIMD
  * implementations can over-read by a few bytes, and use aligned read/write
  * instructions. */
-#define DAV1D_PICTURE_ALIGNMENT 32
+#define DAV1D_PICTURE_ALIGNMENT 64
 
 typedef struct Dav1dPictureParameters {
     int w; ///< width (in pixels)
@@ -77,9 +81,24 @@ typedef struct Dav1dPicture {
      * this picture, as defined in section 5.8.4 and 6.7.4
      */
     Dav1dMasteringDisplay *mastering_display;
+    /**
+     * Array of ITU-T T.35 metadata as defined in section 5.8.2 and 6.7.2
+     */
+    Dav1dITUTT35 *itut_t35;
 
-    struct Dav1dRef *frame_hdr_ref, *seq_hdr_ref; ///< Frame parameter allocation origins
-    struct Dav1dRef *content_light_ref, *mastering_display_ref; ///< Metadata allocation origins
+    /**
+     * Number of ITU-T T35 metadata entries in the array
+     */
+    size_t n_itut_t35;
+
+    uintptr_t reserved[4]; ///< reserved for future use
+
+    struct Dav1dRef *frame_hdr_ref; ///< Dav1dFrameHeader allocation origin
+    struct Dav1dRef *seq_hdr_ref; ///< Dav1dSequenceHeader allocation origin
+    struct Dav1dRef *content_light_ref; ///< Dav1dContentLightLevel allocation origin
+    struct Dav1dRef *mastering_display_ref; ///< Dav1dMasteringDisplay allocation origin
+    struct Dav1dRef *itut_t35_ref; ///< Dav1dITUTT35 allocation origin
+    uintptr_t reserved_ref[4]; ///< reserved for future use
     struct Dav1dRef *ref; ///< Frame data allocation origin
 
     void *allocator_data; ///< pointer managed by the allocator
@@ -130,5 +149,9 @@ typedef struct Dav1dPicAllocator {
  * Release reference to a picture.
  */
 DAV1D_API void dav1d_picture_unref(Dav1dPicture *p);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif /* DAV1D_PICTURE_H */

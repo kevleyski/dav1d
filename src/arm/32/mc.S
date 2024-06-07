@@ -71,8 +71,7 @@
 .macro bidir_fn type
 function \type\()_8bpc_neon, export=1
         push            {r4-r6,lr}
-        ldr             r4, [sp, #16]
-        ldr             r5, [sp, #20]
+        ldrd            r4,  r5,  [sp, #16]
         clz             r4,  r4
 .ifnc \type, avg
         ldr             lr, [sp, #24]
@@ -91,6 +90,7 @@ function \type\()_8bpc_neon, export=1
         \type           d16, d17, q0,  q1,  q2,  q3
         add             r12, r12, r4
         bx              r12
+
         .align 2
 L(\type\()_tbl):
         .word 1280f - L(\type\()_tbl) + CONFIG_THUMB
@@ -99,6 +99,7 @@ L(\type\()_tbl):
         .word 160f  - L(\type\()_tbl) + CONFIG_THUMB
         .word 80f   - L(\type\()_tbl) + CONFIG_THUMB
         .word 4f    - L(\type\()_tbl) + CONFIG_THUMB
+
 4:
         add             r6,  r0,  r1
         lsl             r1,  r1,  #1
@@ -213,6 +214,632 @@ endfunc
 bidir_fn avg
 bidir_fn w_avg
 bidir_fn mask
+
+
+.macro w_mask_fn type
+function w_mask_\type\()_8bpc_neon, export=1
+        push            {r4-r9,lr}
+        ldrd            r4,  r5,  [sp, #28]
+        ldrd            r6,  r7,  [sp, #36]
+        clz             r8,  r4
+        adr             r9,  L(w_mask_\type\()_tbl)
+        sub             r8,  r8,  #24
+        ldr             r8,  [r9,  r8,  lsl #2]
+        add             r9,  r9,  r8
+        movw            r12, #6903
+        vdup.16         q14, r12
+.if \type == 444
+        vmov.i8         q15, #64
+.elseif \type == 422
+        vdup.8          d0,  r7         // d0[] <- sign
+        vmov.i8         d30, #129
+        vsub.i8         d30, d30, d0    // 129 - sign
+.elseif \type == 420
+        vdup.16         q0,  r7         // d0[] <- sign
+        vmov.i16        q15, #256
+        vsub.i16        q15, q15, q0    // 256 - sign
+.endif
+        add             r12, r0,  r1
+        lsl             r1,  r1,  #1
+        bx              r9
+
+        .align 2
+L(w_mask_\type\()_tbl):
+        .word 1280f  - L(w_mask_\type\()_tbl) + CONFIG_THUMB
+        .word 640f   - L(w_mask_\type\()_tbl) + CONFIG_THUMB
+        .word 320f   - L(w_mask_\type\()_tbl) + CONFIG_THUMB
+        .word 160f   - L(w_mask_\type\()_tbl) + CONFIG_THUMB
+        .word 8f     - L(w_mask_\type\()_tbl) + CONFIG_THUMB
+        .word 4f     - L(w_mask_\type\()_tbl) + CONFIG_THUMB
+
+4:
+        vld1.16         {d0,  d1,  d2,  d3},  [r2,  :128]! // tmp1 (four rows at once)
+        vld1.16         {d4,  d5,  d6,  d7},  [r3,  :128]! // tmp2 (four rows at once)
+        subs            r5,  r5,  #4
+        vsub.i16        q8,  q2,  q0    // tmp2-tmp1
+        vsub.i16        q9,  q3,  q1
+        vabd.s16        q10, q0,  q2    // (abs(tmp1[x] - tmp2[x]))
+        vabd.s16        q11, q1,  q3
+        vqsub.u16       q10, q14, q10   // 6903 - abs ()
+        vqsub.u16       q11, q14, q11
+        vshr.s16        q10, q10, #8    // 64-m = (6903 - abs()) >> 8
+        vshr.s16        q11, q11, #8
+        vshl.s16        q12, q10, #9    // (64-m)<<9
+        vshl.s16        q13, q11, #9
+        vqdmulh.s16     q12, q12, q8    // ((tmp2-tmp1)*(64-m)<<9)>>15
+        vqdmulh.s16     q13, q13, q9
+        vadd.i16        q12, q12, q0    // (((tmp2-tmp1)*(64-m)<<9)>>15) + tmp1
+        vadd.i16        q13, q13, q1
+        vqrshrun.s16    d24, q12, #4    // (((((tmp2-tmp1)*(64-m)<<9)>>15) + tmp1) + 8) >> 4
+        vqrshrun.s16    d25, q13, #4
+.if \type == 444
+        vmovn.u16       d20, q10        // 64 - m
+        vmovn.u16       d21, q11
+        vsub.i8         q10, q15, q10   // m
+        vst1.8          {d20, d21}, [r6,  :128]!
+.elseif \type == 422
+        vpadd.s16       d20, d20, d21   // (64 - m) + (64 - n) (column wise addition)
+        vpadd.s16       d21, d22, d23
+        vmovn.s16       d6,  q10
+        vhsub.u8        d6,  d30, d6    // ((129 - sign) - ((64 - m) + (64 - n))) >> 1
+        vst1.8          {d6},  [r6,  :64]!
+.elseif \type == 420
+        vadd.s16        d20, d20, d21   // (64 - my1) + (64 - my2) (row wise addition)
+        vadd.s16        d21, d22, d23
+        vpadd.s16       d20, d20, d21   // (128 - m) + (128 - n) (column wise addition)
+        vsub.s16        d20, d30, d20   // (256 - sign) - ((128 - m) + (128 - n))
+        vrshrn.u16      d20, q10,  #2   // ((256 - sign) - ((128 - m) + (128 - n)) + 2) >> 2
+        vst1.32         {d20[0]}, [r6,  :32]!
+.endif
+        vst1.32         {d24[0]}, [r0,  :32], r1
+        vst1.32         {d24[1]}, [r12, :32], r1
+        vst1.32         {d25[0]}, [r0,  :32], r1
+        vst1.32         {d25[1]}, [r12, :32], r1
+        bgt             4b
+        pop             {r4-r9,pc}
+8:
+        vld1.16         {d0,  d1,  d2,  d3},  [r2,  :128]! // tmp1y1, tmp1y2
+        vld1.16         {d4,  d5,  d6,  d7},  [r3,  :128]! // tmp2y1, tmp2y2
+        subs            r5,  r5,  #2
+        vsub.i16        q8,  q2,  q0    // tmp2y1 - tmp1y1
+        vsub.i16        q9,  q3,  q1    // tmp2y2 - tmp1y2
+        vabd.s16        q10, q0,  q2    // abs(tmp1y1 - tmp2y1)
+        vabd.s16        q11, q1,  q3    // abs(tmp1y2 - tmp2y2)
+        vqsub.u16       q10, q14, q10   // 6903 - abs(tmp1y1 - tmp2y1)
+        vqsub.u16       q11, q14, q11   // 6903 - abs(tmp1y2 - tmp2y2)
+        vshr.s16        q10, q10, #8    // 64 - my1 = 6903 - abs(tmp1y1 - tmp2y1) >> 8
+        vshr.s16        q11, q11, #8    // 64 - my2 = 6903 - abs(tmp1y2 - tmp2y2) >> 8
+        vshl.s16        q12, q10, #9    // (64 - my1) << 9
+        vshl.s16        q13, q11, #9    // (64 - my2) << 9
+        vqdmulh.s16     q12, q12, q8    // ((tmp2y1 - tmp1y1) * (64 - my1) << 9) >> 15
+        vqdmulh.s16     q13, q13, q9    // ((tmp2y2 - tmp1y2) * (64 - my2) << 9) >> 15
+        vadd.s16        q12, q12, q0    // (((tmp2y1 - tmp1y1) * (64 - my1) << 9) >> 15) + tmp1y1
+        vadd.s16        q13, q13, q1    // (((tmp2y2 - tmp1y2) * (64 - my2) << 9) >> 15) + tmp1y2
+        vqrshrun.s16    d24, q12, #4    // (((((tmp2y1 - tmp1y1) * (64 - my1) << 9) >> 15) + tmp1y1) + 8) >> 4
+        vqrshrun.s16    d25, q13, #4    // (((((tmp2y2 - tmp1y2) * (64 - my2) << 9) >> 15) + tmp1y2) + 8) >> 4
+.if \type == 444
+        vmovn.u16       d20, q10        // 64 - m
+        vmovn.u16       d21, q11
+        vsub.i8         q10, q15, q10   // m
+        vst1.8          {d20, d21}, [r6,  :128]!
+.elseif \type == 422
+        vpadd.s16       d20, d20, d21   // (64 - my1) + (64 - ny1) (column wise addition)
+        vpadd.s16       d21, d22, d23   // (64 - my2) + (64 - ny2)
+        vmovn.s16       d20, q10
+        vhsub.u8        d20, d30, d20   // ((129 - sign) - ((64 - my1/y2) + (64 - ny1/y2))) >> 1
+        vst1.8          {d20}, [r6,  :64]!
+.elseif \type == 420
+        vadd.s16        q10, q10, q11   // (64 - my1) + (64 - my2) (row wise addition)
+        vpadd.s16       d20, d20, d21   // (128 - m) + (128 - n) (column wise addition)
+        vsub.s16        d20, d30, d20   // (256 - sign) - ((128 - m) + (128 - n))
+        vrshrn.u16      d20, q10, #2    // ((256 - sign) - ((128 - m) + (128 - n)) + 2) >> 2
+        vst1.32         {d20[0]}, [r6,  :32]!
+.endif
+        vst1.16         {d24}, [r0,  :64], r1
+        vst1.16         {d25}, [r12, :64], r1
+        bgt             8b
+        pop             {r4-r9,pc}
+1280:
+640:
+320:
+160:
+        sub             r1,  r1,  r4
+.if \type == 444
+        add             lr,  r6,  r4
+.elseif \type == 422
+        add             lr,  r6,  r4,  lsr #1
+.endif
+        add             r9,  r3,  r4,  lsl #1
+        add             r7,  r2,  r4,  lsl #1
+161:
+        mov             r8,  r4
+16:
+        vld1.16         {d0,  d1,  d2,  d3},  [r2,  :128]! // tmp1y1
+        vld1.16         {d4,  d5,  d6,  d7},  [r3,  :128]! // tmp2y1
+        vld1.16         {d16, d17, d18, d19}, [r7,  :128]! // tmp1y2
+        subs            r8,  r8,  #16
+        vsub.i16        q2,  q2,  q0    // tmp2y1 - tmp1y1
+        vsub.i16        q3,  q3,  q1
+        vabs.s16        q10, q2         // abs(tm2y1 - tmp1y1)
+        vabs.s16        q11, q3
+        vqsub.u16       q10, q14, q10   // 6903 - abs(tmp1y1 - tmp2y1)
+        vqsub.u16       q11, q14, q11
+        vshr.s16        q10, q10, #8    // 64 - my1 = 6903 - abs(tmp1y1 - tmp2y1) >> 8
+        vshr.s16        q11, q11, #8
+        vshl.s16        q12, q10, #9    // (64 - my1) << 9
+        vshl.s16        q13, q11, #9
+        vqdmulh.s16     q12, q12, q2    // ((tmp2y1 - tmp1y1) * (64 - my1) << 9) >> 15
+        vqdmulh.s16     q13, q13, q3
+        vadd.i16        q12, q12, q0    // (((tmp2y1 - tmp1y1) * (64 - my1) << 9) >> 15) + tmp1y1
+        vadd.i16        q13, q13, q1
+        vld1.16         {d0,  d1,  d2,  d3},  [r9,  :128]! // tmp2h2
+.if \type == 444
+        vmovn.u16       d20, q10        // 64 - my1
+        vmovn.u16       d21, q11
+        vsub.i8         q10, q15, q10   // my1
+        vst1.8          {d20, d21}, [r6,  :128]!
+.elseif \type == 422
+        vpadd.s16       d20, d20, d21   // (64 - my1) + (64 - ny1) (column wise addition)
+        vpadd.s16       d21, d22, d23
+        vmovn.s16       d20, q10
+        vhsub.u8        d20, d30, d20   // ((129 - sign) - ((64 - my1) + (64 - ny1))) >> 1
+        vst1.8          {d20}, [r6,  :64]!
+.endif
+        vqrshrun.s16    d24, q12, #4    // (((((tmp2y1 - tmp1y1)*(64 - my1) << 9) >> 15) + tmp1y1) + 8) >> 4
+        vqrshrun.s16    d25, q13, #4
+        vsub.i16        q0,  q0,  q8    // tmp2y2 - tmp1y2
+        vsub.i16        q1,  q1,  q9
+        vst1.16         {d24, d25}, [r0,  :128]!    // store dsty1
+        vabs.s16        q2,  q0         // abs(tmp2y2 - tmp1y2)
+        vabs.s16        q3,  q1
+        vqsub.u16       q2,  q14, q2    // 6903 - abs(tmp2y2 - tmp1y2)
+        vqsub.u16       q3,  q14, q3
+        vshr.s16        q2,  q2,  #8    // (6903 - abs(tmp2y2 - tmp1y2)) >> 8
+        vshr.s16        q3,  q3,  #8
+        vshl.s16        q12, q2,  #9    // (64 - my2) << 9
+        vshl.s16        q13, q3,  #9
+.if \type == 444
+        vmovn.u16       d4,  q2         // 64 - my2
+        vmovn.u16       d5,  q3
+        vsub.i8         q2,  q15, q2    // my2
+        vst1.8          {d4,  d5},  [lr,  :128]!
+.elseif \type == 422
+        vpadd.s16       d4,  d4,  d5    // (64 - my2) + (64 - ny2) (column wise addition)
+        vpadd.s16       d5,  d6,  d7
+        vmovn.s16       d4,  q2
+        vhsub.u8        d4,  d30, d4    // ((129 - sign) - ((64 - my2) + (64 - ny2))) >> 1
+        vst1.8          {d4},  [lr,  :64]!
+.elseif \type == 420
+        vadd.s16        q10, q10, q2    // (64 - my1) + (64 - my2) (row wise addition)
+        vadd.s16        q11, q11, q3
+        vpadd.s16       d20, d20, d21   // (128 - m) + (128 - n) (column wise addition)
+        vpadd.s16       d21, d22, d23
+        vsub.s16        q10, q15, q10   // (256 - sign) - ((128 - m) + (128 - n))
+        vrshrn.u16      d20, q10, #2    // ((256 - sign) - ((128 - m) + (128 - n)) + 2) >> 2
+        vst1.8          {d20}, [r6,  :64]!
+.endif
+        vqdmulh.s16     q12, q12, q0    // ((tmp2y2 - tmp1y2) * (64 - my2) << 9) >> 15
+        vqdmulh.s16     q13, q13, q1
+        vadd.i16        q12, q12, q8    // (((tmp2y2 - tmp1y2) * (64 - my2) << 9) >> 15) + tmp1y2
+        vadd.i16        q13, q13, q9
+        vqrshrun.s16    d24, q12, #4    // (((((tmp2y2 - tmp1y2)*(64 - my2) << 9) >> 15) + tmp1y2) + 8) >> 4
+        vqrshrun.s16    d25, q13, #4
+        vst1.16         {d24, d25}, [r12, :128]!   // store dsty2
+        bgt             16b
+        subs            r5,  r5,  #2
+        add             r2,  r2,  r4,  lsl #1
+        add             r3,  r3,  r4,  lsl #1
+        add             r7,  r7,  r4,  lsl #1
+        add             r9,  r9,  r4,  lsl #1
+.if \type == 444
+        add             r6,  r6,  r4
+        add             lr,  lr,  r4
+.elseif \type == 422
+        add             r6,  r6,  r4,  lsr #1
+        add             lr,  lr,  r4,  lsr #1
+.endif
+        add             r0,  r0,  r1
+        add             r12, r12, r1
+        bgt             161b
+        pop             {r4-r9,pc}
+endfunc
+.endm
+
+w_mask_fn 444
+w_mask_fn 422
+w_mask_fn 420
+
+
+function blend_8bpc_neon, export=1
+        push            {r4-r5,lr}
+        ldrd            r4,  r5,  [sp, #12]
+        clz             lr,  r3
+        adr             r3,  L(blend_tbl)
+        sub             lr,  lr,  #26
+        ldr             lr,  [r3, lr, lsl #2]
+        add             r3,  r3,  lr
+        bx              r3
+
+        .align 2
+L(blend_tbl):
+        .word 320f  - L(blend_tbl) + CONFIG_THUMB
+        .word 160f  - L(blend_tbl) + CONFIG_THUMB
+        .word 80f   - L(blend_tbl) + CONFIG_THUMB
+        .word 40f   - L(blend_tbl) + CONFIG_THUMB
+
+40:
+        vmov.i8         d22, #64
+        add             r12, r0,  r1
+        lsl             r1,  r1,  #1
+4:
+        vld1.u8         {d2},     [r5,  :64]!
+        vld1.u8         {d1},     [r2,  :64]!
+        vld1.32         {d0[]},   [r0,  :32]
+        subs            r4,  r4,  #2
+        vld1.32         {d0[1]},  [r12, :32]
+        vsub.i8         d3,  d22, d2
+        vmull.u8        q8,  d1,  d2
+        vmlal.u8        q8,  d0,  d3
+        vrshrn.i16      d20, q8,  #6
+        vst1.32         {d20[0]}, [r0,  :32], r1
+        vst1.32         {d20[1]}, [r12, :32], r1
+        bgt             4b
+        pop             {r4-r5,pc}
+80:
+        vmov.i8         d16, #64
+        add             r12, r0,  r1
+        lsl             r1,  r1,  #1
+8:
+        vld1.u8         {q1},  [r5,  :128]!
+        vld1.u8         {q2},  [r2,  :128]!
+        vld1.u8         {d0},  [r0,  :64]
+        vsub.i8         d17, d16, d2
+        vld1.u8         {d1},  [r12, :64]
+        subs            r4,  r4,  #2
+        vsub.i8         d18, d16, d3
+        vmull.u8        q3,  d2,  d4
+        vmlal.u8        q3,  d0,  d17
+        vmull.u8        q10, d3,  d5
+        vmlal.u8        q10, d1,  d18
+        vrshrn.i16      d22, q3,  #6
+        vrshrn.i16      d23, q10, #6
+        vst1.u8         {d22}, [r0,  :64], r1
+        vst1.u8         {d23}, [r12, :64], r1
+        bgt             8b
+        pop             {r4-r5,pc}
+160:
+        vmov.i8         q12, #64
+        add             r12, r0,  r1
+        lsl             r1,  r1,  #1
+16:
+        vld1.u8         {q1,  q2},  [r5,  :128]!
+        vld1.u8         {q8,  q9},  [r2,  :128]!
+        vld1.u8         {q0},  [r0,  :128]
+        subs            r4,  r4,  #2
+        vsub.i8         q15, q12, q1
+        vld1.u8         {q13}, [r12, :128]
+        vmull.u8        q3,  d16, d2
+        vmlal.u8        q3,  d0,  d30
+        vmull.u8        q14, d17, d3
+        vmlal.u8        q14, d1,  d31
+        vsub.i8         q15, q12, q2
+        vrshrn.i16      d20, q3,  #6
+        vrshrn.i16      d21, q14, #6
+        vmull.u8        q3,  d18, d4
+        vmlal.u8        q3,  d26, d30
+        vmull.u8        q14, d19, d5
+        vmlal.u8        q14, d27, d31
+        vrshrn.i16      d22, q3,  #6
+        vrshrn.i16      d23, q14, #6
+        vst1.u8         {q10}, [r0,  :128], r1
+        vst1.u8         {q11}, [r12, :128], r1
+        bgt             16b
+        pop             {r4-r5,pc}
+320:
+        vmov.i8         q10, #64
+32:
+        vld1.u8         {q2,  q3},  [r5,  :128]!
+        vld1.u8         {q8,  q9},  [r2,  :128]!
+        vld1.u8         {q0,  q1},  [r0,  :128]
+        subs            r4,  r4,  #1
+        vsub.i8         q11, q10, q2
+        vmull.u8        q15, d16, d4
+        vmlal.u8        q15, d0,  d22
+        vmull.u8        q14, d17, d5
+        vmlal.u8        q14, d1,  d23
+        vsub.i8         q11, q10, q3
+        vrshrn.i16      d24, q15, #6
+        vrshrn.i16      d25, q14, #6
+        vmull.u8        q15, d18, d6
+        vmlal.u8        q15, d2,  d22
+        vmull.u8        q14, d19, d7
+        vmlal.u8        q14, d3,  d23
+        vrshrn.i16      d26, q15, #6
+        vrshrn.i16      d27, q14, #6
+        vst1.u8         {q12, q13}, [r0,  :128],  r1
+        bgt             32b
+        pop             {r4-r5,pc}
+endfunc
+
+function blend_h_8bpc_neon, export=1
+        push            {r4-r5,lr}
+        ldr             r4,  [sp, #12]
+        movrel          r5,  X(obmc_masks)
+        add             r5,  r5,  r4
+        sub             r4,  r4,  r4,  lsr #2
+        clz             lr,  r3
+        adr             r12, L(blend_h_tbl)
+        sub             lr,  lr,  #24
+        ldr             lr,  [r12, lr, lsl #2]
+        add             r12, r12, lr
+        bx              r12
+
+        .align 2
+L(blend_h_tbl):
+        .word 1280f  - L(blend_h_tbl) + CONFIG_THUMB
+        .word 640f   - L(blend_h_tbl) + CONFIG_THUMB
+        .word 320f   - L(blend_h_tbl) + CONFIG_THUMB
+        .word 160f   - L(blend_h_tbl) + CONFIG_THUMB
+        .word 80f    - L(blend_h_tbl) + CONFIG_THUMB
+        .word 40f    - L(blend_h_tbl) + CONFIG_THUMB
+        .word 20f    - L(blend_h_tbl) + CONFIG_THUMB
+
+20:
+        vmov.i8         d22, #64
+        add             r12, r0,  r1
+        lsl             r1,  r1,  #1
+2:
+        vld1.16         {d2[], d3[]},  [r5,  :16]!
+        vld1.32         {d1[]},  [r2,  :32]!
+        subs            r4,  r4,  #2
+        vld1.16         {d0[]},   [r0,  :16]
+        vzip.8          d2,  d3
+        vsub.i8         d4,  d22, d2
+        vld1.16         {d0[1]},  [r12, :16]
+        vmull.u8        q8,  d1,  d2
+        vmlal.u8        q8,  d0,  d4
+        vrshrn.i16      d20, q8,  #6
+        vst1.16         {d20[0]}, [r0,  :16], r1
+        vst1.16         {d20[1]}, [r12, :16], r1
+        bgt             2b
+        pop             {r4-r5,pc}
+40:
+        vmov.i8         d22, #64
+        add             r12, r0,  r1
+        lsl             r1,  r1,  #1
+4:
+        vld2.u8         {d2[],  d3[]},   [r5,  :16]!
+        vld1.u8         {d1},     [r2,  :64]!
+        subs            r4,  r4,  #2
+        vext.u8         d2,  d2,  d3,   #4
+        vld1.32         {d0[]},   [r0,  :32]
+        vsub.i8         d6,  d22, d2
+        vld1.32         {d0[1]},  [r12, :32]
+        vmull.u8        q8,  d1,  d2
+        vmlal.u8        q8,  d0,  d6
+        vrshrn.i16      d20, q8,  #6
+        vst1.32         {d20[0]}, [r0,  :32], r1
+        vst1.32         {d20[1]}, [r12, :32], r1
+        bgt             4b
+        pop             {r4-r5,pc}
+80:
+        vmov.i8         q8, #64
+        add             r12, r0,  r1
+        lsl             r1,  r1,  #1
+8:
+        vld2.u8         {d2[],  d3[]},  [r5,  :16]!
+        vld1.u8         {d4,  d5},  [r2,  :128]!
+        vld1.u8         {d0},   [r0,  :64]
+        vsub.i8         q9,  q8,  q1
+        vld1.u8         {d1},   [r12, :64]
+        subs            r4,  r4,  #2
+        vmull.u8        q3,  d2,  d4
+        vmlal.u8        q3,  d0,  d18
+        vmull.u8        q10, d3,  d5
+        vmlal.u8        q10, d1,  d19
+        vrshrn.i16      d22, q3,  #6
+        vrshrn.i16      d23, q10, #6
+        vst1.u8         {d22}, [r0,  :64], r1
+        vst1.u8         {d23}, [r12, :64], r1
+        bgt             8b
+        pop             {r4-r5,pc}
+160:
+        vmov.i8         q12, #64
+        add             r12, r0,  r1
+        lsl             r1,  r1,  #1
+16:
+        vld2.u8         {d28[], d29[]}, [r5,  :16]!
+        vld1.u8         {d2,  d3,  d4,  d5},  [r2,  :128]!
+        vsub.i8         q15, q12, q14
+        vld1.u8         {q0},  [r0,  :128]
+        subs            r4,  r4,  #2
+        vld1.u8         {q13}, [r12, :128]
+        vmull.u8        q3,  d2,  d28
+        vmlal.u8        q3,  d0,  d30
+        vmull.u8        q8,  d3,  d28
+        vmlal.u8        q8,  d1,  d30
+        vrshrn.i16      d18, q3,  #6
+        vrshrn.i16      d19, q8,  #6
+        vmull.u8        q3,  d4,  d29
+        vmlal.u8        q3,  d26, d31
+        vmull.u8        q8,  d5,  d29
+        vmlal.u8        q8,  d27, d31
+        vrshrn.i16      d20, q3,  #6
+        vrshrn.i16      d21, q8,  #6
+        vst1.u8         {q9},  [r0,  :128], r1
+        vst1.u8         {q10}, [r12, :128], r1
+        bgt             16b
+        pop             {r4-r5,pc}
+320:
+640:
+1280:
+        vmov.i8         d20, #64
+        sub             r1,  r1,  r3
+321:
+        vld1.u8         {d6[]},  [r5]!
+        vsub.i8         d7,  d20, d6
+        mov             r12, r3
+32:
+        vld1.u8         {q8,  q9},  [r2,  :128]!
+        vld1.u8         {q0,  q1},  [r0,  :128]
+        vmull.u8        q15, d16, d6
+        vmlal.u8        q15, d0,  d7
+        vmull.u8        q14, d17, d6
+        vmlal.u8        q14, d1,  d7
+        vrshrn.i16      d0,  q15, #6
+        vrshrn.i16      d1,  q14, #6
+        vmull.u8        q15, d18, d6
+        vmlal.u8        q15, d2,  d7
+        vmull.u8        q14, d19, d6
+        vmlal.u8        q14, d3,  d7
+        vrshrn.i16      d2,  q15, #6
+        vrshrn.i16      d3,  q14, #6
+        subs            r12, r12, #32
+        vst1.u8         {q0,  q1},  [r0,  :128]!
+        bgt             32b
+        add             r0,  r0,  r1
+        subs            r4,  r4,  #1
+        bgt             321b
+        pop             {r4-r5,pc}
+endfunc
+
+function blend_v_8bpc_neon, export=1
+        push            {r4,lr}
+        ldr             r4,  [sp, #8]
+        movrel          lr,  X(obmc_masks)
+        add             lr,  lr,  r3
+        clz             r12, r3
+        adr             r3,  L(blend_v_tbl)
+        sub             r12, r12, #26
+        ldr             r12, [r3, r12, lsl #2]
+        add             r3,  r3,  r12
+        bx              r3
+
+        .align 2
+L(blend_v_tbl):
+        .word 320f  - L(blend_v_tbl) + CONFIG_THUMB
+        .word 160f  - L(blend_v_tbl) + CONFIG_THUMB
+        .word 80f   - L(blend_v_tbl) + CONFIG_THUMB
+        .word 40f   - L(blend_v_tbl) + CONFIG_THUMB
+        .word 20f   - L(blend_v_tbl) + CONFIG_THUMB
+
+20:
+        vmov.i8         d22, #64
+        vld1.8          {d2[]},   [lr]
+        add             r12, r0,  r1
+        lsl             r1,  r1,  #1
+        vsub.i8         d3,  d22, d2
+2:
+        vld1.16         {d1[0]},  [r2,  :16]!
+        vld1.8          {d0[]},   [r0]
+        subs            r4,  r4,  #2
+        vld1.8          {d1[1]},  [r2]
+        vld1.8          {d0[1]},  [r12]
+        vmull.u8        q2,  d1,  d2
+        vmlal.u8        q2,  d0,  d3
+        vrshrn.i16      d6,  q2,  #6
+        add             r2,  r2,  #2
+        vst1.8          {d6[0]},  [r0],  r1
+        vst1.8          {d6[1]},  [r12], r1
+        bgt             2b
+        pop             {r4,pc}
+40:
+        vmov.i8         d22, #64
+        vld1.32         {d4[]},   [lr,  :32]
+        add             r12, r0,  r1
+        lsl             r1,  r1,  #1
+        vsub.i8         d5,  d22, d4
+        sub             r1,  r1,  #2
+4:
+        vld1.u8         {d2},     [r2,  :64]!
+        vld1.32         {d0[]},   [r0,  :32]
+        vld1.32         {d0[1]},  [r12, :32]
+        subs            r4,  r4,  #2
+        vmull.u8        q3,  d2,  d4
+        vmlal.u8        q3,  d0,  d5
+        vrshrn.i16      d20, q3,  #6
+        vst1.16         {d20[0]}, [r0,  :16]!
+        vst1.16         {d20[2]}, [r12, :16]!
+        vst1.8          {d20[2]}, [r0],  r1
+        vst1.8          {d20[6]}, [r12], r1
+        bgt             4b
+        pop             {r4,pc}
+80:
+        vmov.i8         d16, #64
+        vld1.u8         {d2},  [lr,  :64]
+        add             r12, r0,  r1
+        lsl             r1,  r1,  #1
+        vsub.i8         d17, d16, d2
+        sub             r1,  r1,  #4
+8:
+        vld1.u8         {d4,  d5},  [r2,  :128]!
+        vld1.u8         {d0},  [r0,  :64]
+        vld1.u8         {d1},  [r12, :64]
+        subs            r4,  r4,  #2
+        vmull.u8        q3,  d2,  d4
+        vmlal.u8        q3,  d0,  d17
+        vmull.u8        q10, d2,  d5
+        vmlal.u8        q10, d1,  d17
+        vrshrn.i16      d22, q3,  #6
+        vrshrn.i16      d23, q10, #6
+        vst1.32         {d22[0]}, [r0,  :32]!
+        vst1.32         {d23[0]}, [r12, :32]!
+        vst1.16         {d22[2]}, [r0,  :16], r1
+        vst1.16         {d23[2]}, [r12, :16], r1
+        bgt             8b
+        pop             {r4,pc}
+160:
+        vmov.i8         q12, #64
+        vld1.u8         {q14}, [lr,  :128]
+        add             r12, r0,  r1
+        lsl             r1,  r1,  #1
+        vsub.i8         q11, q12, q14
+        sub             r1,  r1,  #8
+16:
+        vld1.u8         {q1,  q2},  [r2,  :128]!
+        vld1.u8         {q0},  [r0,  :128]
+        subs            r4,  r4,  #2
+        vld1.u8         {q13}, [r12, :128]
+        vmull.u8        q3,  d2,  d28
+        vmlal.u8        q3,  d0,  d22
+        vmull.u8        q8,  d3,  d29
+        vmlal.u8        q8,  d1,  d23
+        vrshrn.i16      d18, q3,  #6
+        vrshrn.i16      d19, q8,  #6
+        vmull.u8        q3,  d4,  d28
+        vmlal.u8        q3,  d26, d22
+        vmull.u8        q8,  d5,  d29
+        vmlal.u8        q8,  d27, d23
+        vrshrn.i16      d20, q3,  #6
+        vrshrn.i16      d21, q8,  #6
+        vst1.u8         {d18},    [r0,  :64]!
+        vst1.u8         {d20},    [r12, :64]!
+        vst1.32         {d19[0]}, [r0,  :32], r1
+        vst1.32         {d21[0]}, [r12, :32], r1
+        bgt             16b
+        pop             {r4,pc}
+320:
+        vmov.i8         q10, #64
+        vld1.u8         {q2,  q3},  [lr,  :128]
+        vsub.i8         q11, q10, q2
+        vsub.i8         d24, d20, d6
+32:
+        vld1.u8         {q8,  q9},  [r2,  :128]!
+        vld1.u8         {d0,  d1,  d2},  [r0,  :64]
+        subs            r4,  r4,  #1
+        vmull.u8        q15, d16, d4
+        vmlal.u8        q15, d0,  d22
+        vmull.u8        q14, d17, d5
+        vmlal.u8        q14, d1,  d23
+        vrshrn.i16      d0,  q15, #6
+        vrshrn.i16      d1,  q14, #6
+        vmull.u8        q15, d18, d6
+        vmlal.u8        q15, d2,  d24
+        vrshrn.i16      d2,  q15, #6
+        vst1.u8         {d0,  d1,  d2},  [r0,  :64],  r1
+        bgt             32b
+        pop             {r4,pc}
+endfunc
 
 
 // This has got the same signature as the put_8tap functions,
@@ -519,6 +1146,16 @@ endfunc
         vmla.s16        \d,  \s2,  d0[2]
         vmla.s16        \d,  \s3,  d0[3]
 .endm
+.macro mul_mla_8_0 d0, s0, s1, s2, s3, s4, s5, s6, s7
+        vmul.s16        \d0, \s0,  d0[0]
+        vmla.s16        \d0, \s1,  d0[1]
+        vmla.s16        \d0, \s2,  d0[2]
+        vmla.s16        \d0, \s3,  d0[3]
+        vmla.s16        \d0, \s4,  d1[0]
+        vmla.s16        \d0, \s5,  d1[1]
+        vmla.s16        \d0, \s6,  d1[2]
+        vmla.s16        \d0, \s7,  d1[3]
+.endm
 .macro mul_mla_8_1 d0, d1, s0, s1, s2, s3, s4, s5, s6, s7, s8
         vmul.s16        \d0, \s0, d0[0]
         vmla.s16        \d0, \s1, d0[1]
@@ -554,24 +1191,6 @@ endfunc
         vmla.s16        \d1, \s7, d1[1]
         vmla.s16        \d1, \s8, d1[2]
         vmla.s16        \d1, \s9, d1[3]
-.endm
-.macro mul_mla_8_4 d0, d1, s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11
-        vmul.s16        \d0, \s0,  d0[0]
-        vmla.s16        \d0, \s1,  d0[1]
-        vmla.s16        \d0, \s2,  d0[2]
-        vmla.s16        \d0, \s3,  d0[3]
-        vmla.s16        \d0, \s4,  d1[0]
-        vmla.s16        \d0, \s5,  d1[1]
-        vmla.s16        \d0, \s6,  d1[2]
-        vmla.s16        \d0, \s7,  d1[3]
-        vmul.s16        \d1, \s4,  d0[0]
-        vmla.s16        \d1, \s5,  d0[1]
-        vmla.s16        \d1, \s6,  d0[2]
-        vmla.s16        \d1, \s7,  d0[3]
-        vmla.s16        \d1, \s8,  d1[0]
-        vmla.s16        \d1, \s9,  d1[1]
-        vmla.s16        \d1, \s10, d1[2]
-        vmla.s16        \d1, \s11, d1[3]
 .endm
 .macro vqrshrun_s16 shift, q0, d0, q1, d1, q2, d2, q3, d3
         vqrshrun.s16    \d0, \q0, #\shift
@@ -772,12 +1391,12 @@ L(\type\()_8tap_h_tbl):
         vld1.8          {d24}, [\sr2], \s_strd
         vmovl.u8        q8,  d16
         vmovl.u8        q12, d24
-        vext.8          q9,  q8,  q8,  #2
-        vext.8          q10, q8,  q8,  #4
-        vext.8          q11, q8,  q8,  #6
-        vext.8          q13, q12, q12, #2
-        vext.8          q14, q12, q12, #4
-        vext.8          q15, q12, q12, #6
+        vext.8          d18, d16, d17, #2
+        vext.8          d20, d16, d17, #4
+        vext.8          d22, d16, d17, #6
+        vext.8          d26, d24, d25, #2
+        vext.8          d28, d24, d25, #4
+        vext.8          d30, d24, d25, #6
         subs            \h,  \h,  #2
         vmul.s16        d4,  d16, d0[0]
         vmla.s16        d4,  d18, d0[1]
@@ -800,7 +1419,7 @@ L(\type\()_8tap_h_tbl):
         pop             {r4-r11,pc}
 
 80:     // 8xN h
-        vld1.8          {d0}, [\mx]
+        vld1.8          {d0}, [\mx, :64]
         sub             \src,  \src,  #3
         add             \ds2,  \dst,  \d_strd
         add             \sr2,  \src,  \s_strd
@@ -851,7 +1470,7 @@ L(\type\()_8tap_h_tbl):
         // one temporary for vext in the loop. That's slower on A7 and A53,
         // (but surprisingly, marginally faster on A8 and A73).
         vpush           {q4-q6}
-        vld1.8          {d0}, [\mx]
+        vld1.8          {d0}, [\mx, :64]
         sub             \src,  \src,  #3
         add             \ds2,  \dst,  \d_strd
         add             \sr2,  \src,  \s_strd
@@ -996,9 +1615,9 @@ L(\type\()_8tap_v_tbl):
         st_16           \d_strd, d6, 4
         pop             {r4-r11,pc}
 
-28:     // 2x8, 2x16 v
+28:     // 2x6, 2x8, 2x12, 2x16 v
         vpush           {q4-q7}
-        vld1.8          {d0}, [\my]
+        vld1.8          {d0}, [\my, :64]
         sub             \sr2,  \src,  \s_strd, lsl #1
         add             \ds2,  \dst,  \d_strd
         sub             \src,  \sr2,  \s_strd
@@ -1015,34 +1634,37 @@ L(\type\()_8tap_v_tbl):
         vmov            d7,  d10
         vmov            d9,  d12
 216:
-        subs            \h,  \h,  #8
+        subs            \h,  \h,  #4
         load_16         \sr2, \src, \s_strd, d16, d18, d20, d22
-        load_16         \sr2, \src, \s_strd, d24, d26, d28, d30
         interleave_1_16 d14, d16, d18, d20, d22
-        interleave_1_16 d22, d24, d26, d28, d30
         vmovl_u8        q7,  d14, q8,  d16, q9,  d18, q10, d20
-        vmovl_u8        q11, d22, q12, d24, q13, d26, q14, d28
         vmov            d11, d14
         vmov            d13, d16
         vmov            d15, d18
         vmov            d17, d20
-        vmov            d19, d22
-        vmov            d21, d24
-        vmov            d23, d26
-        vmov            d25, d28
-        mul_mla_8_4     q1,  q2,  q1,  q2,  q3,  q4,  q5,  q6,  q7,  q8,  q9,  q10, q11, q12
-        vqrshrun_s16    6,   q1,  d2,  q2,  d4
+        mul_mla_8_0     q1,  q1,  q2,  q3,  q4,  q5,  q6,  q7, q8
+        vqrshrun_s16    6,   q1,  d2
         st_16           \d_strd, d2, 4
-        st_16           \d_strd, d4, 4
         ble             0f
-        vmov            q1,  q9
-        vmov            q2,  q10
-        vmov            q3,  q11
-        vmov            q4,  q12
-        vmov            q5,  q13
-        vmov            q6,  q14
-        vmov            d14, d30
+        cmp             \h,  #2
+        vmov            q1,  q5
+        vmov            q2,  q6
+        vmov            q3,  q7
+        vmov            q4,  q8
+        vmov            q5,  q9
+        vmov            q6,  q10
+        vmov            d14, d22
+        beq             26f
         b               216b
+26:
+        load_16         \sr2, \src, \s_strd, d16, d18
+        interleave_1_16 d14, d16, d18
+        vmovl_u8        q7,  d14, q8,  d16
+        vmov            d11, d14
+        vmov            d13, d16
+        mul_mla_8_0     d2,  d2,  d4,  d6,  d8,  d10, d12, d14, d16
+        vqrshrun_s16    6,   q1,  d2
+        st_16           \d_strd, d2, 2
 0:
         vpop            {q4-q7}
         pop             {r4-r11,pc}
@@ -1076,9 +1698,9 @@ L(\type\()_8tap_v_tbl):
 0:
         pop             {r4-r11,pc}
 
-480:    // 4x8, 4x16 v
+480:    // 4x6, 4x8, 4x12, 4x16 v
         vpush           {q4}
-        vld1.8          {d0}, [\my]
+        vld1.8          {d0}, [\my, :64]
         sub             \sr2, \src, \s_strd, lsl #1
         add             \ds2, \dst, \d_strd
         sub             \src, \sr2, \s_strd
@@ -1099,12 +1721,19 @@ L(\type\()_8tap_v_tbl):
         mul_mla_8_2     q1,  q2,  q1,  q2,  q3,  q4,  q8,  q9,  q10, q11, q12, q13
         shift_store_4   \type, \d_strd, q1,  d2,  d3,  q2,  d4,  d5
         ble             0f
-        subs            \h,  \h,  #4
-        load_32         \sr2,  \src, \s_strd, d30, d2,  d4,  d6
-        interleave_1_32 d28, d30, d2,  d4,  d6
-        vmovl_u8        q14, d28, q15, d30, q1,  d2,  q2,  d4
-        mul_mla_8_2     q8,  q9,  q8,  q9,  q10, q11, q12, q13, q14, q15, q1,  q2
-        shift_store_4   \type, \d_strd, q8,  d16, d17, q9,  d18, d19
+        load_32         \sr2,  \src, \s_strd, d30, d2
+        subs            \h,  \h,  #2
+        interleave_1_32 d28, d30, d2
+        vmovl_u8        q14, d28, q15, d30
+        mul_mla_8_0     q8,  q8,  q9,  q10, q11, q12, q13, q14, q15
+        shift_store_4   \type, \d_strd, q8,  d16, d17
+        ble             0f
+        load_32         \sr2,  \src, \s_strd, d4,  d6
+        subs            \h,  \h,  #2
+        interleave_1_32 d2,  d4,  d6
+        vmovl_u8        q1,  d2,  q2,  d4
+        mul_mla_8_0     q9,  q10, q11, q12, q13, q14, q15, q1,  q2
+        shift_store_4   \type, \d_strd, q9,  d18, d19
         ble             0f
         subs            \h,  \h,  #4
         load_32         \sr2, \src, \s_strd, d8,  d16, d18, d20
@@ -1151,7 +1780,7 @@ L(\type\()_8tap_v_tbl):
 640:
 1280:
         vpush           {q4}
-        vld1.8          {d0}, [\my]
+        vld1.8          {d0}, [\my, :64]
         sub             \src, \src, \s_strd
         sub             \src, \src, \s_strd, lsl #1
         vmovl.s8        q0,  d0
@@ -1320,11 +1949,10 @@ L(\type\()_8tap_hv_tbl):
         bl              L(\type\()_8tap_filter_2)
 
         vext.8          d18, d17, d26, #4
-        vmov            d19, d26
         vmull.s16       q2,  d16, d2[0]
         vmlal.s16       q2,  d17, d2[1]
         vmlal.s16       q2,  d18, d2[2]
-        vmlal.s16       q2,  d19, d2[3]
+        vmlal.s16       q2,  d26, d2[3]
 
         vqrshrn.s32     d4,  q2,  #\shift_hv
         vqmovun.s16     d4,  q2
@@ -1333,11 +1961,11 @@ L(\type\()_8tap_hv_tbl):
         vst1.16         {d4[1]}, [\ds2, :16], \d_strd
         ble             0f
         vmov            d16, d18
-        vmov            d17, d19
+        vmov            d17, d26
         b               2b
 
 280:    // 2x8, 2x16, 2x32 hv
-        vld1.8          {d2},  [\my]
+        vld1.8          {d2},  [\my, :64]
         sub             \src, \src, #1
         sub             \sr2, \src, \s_strd, lsl #1
         sub             \src, \sr2, \s_strd
@@ -1370,7 +1998,6 @@ L(\type\()_8tap_hv_tbl):
 28:
         bl              L(\type\()_8tap_filter_2)
         vext.8          d22, d21, d26, #4
-        vmov            d23, d26
         vmull.s16       q2,  d16, d2[0]
         vmlal.s16       q2,  d17, d2[1]
         vmlal.s16       q2,  d18, d2[2]
@@ -1378,7 +2005,7 @@ L(\type\()_8tap_hv_tbl):
         vmlal.s16       q2,  d20, d3[0]
         vmlal.s16       q2,  d21, d3[1]
         vmlal.s16       q2,  d22, d3[2]
-        vmlal.s16       q2,  d23, d3[3]
+        vmlal.s16       q2,  d26, d3[3]
 
         vqrshrn.s32     d4,  q2,  #\shift_hv
         vqmovun.s16     d4,  q2
@@ -1391,7 +2018,7 @@ L(\type\()_8tap_hv_tbl):
         vmov            d18, d20
         vmov            d19, d21
         vmov            d20, d22
-        vmov            d21, d23
+        vmov            d21, d26
         b               28b
 
 0:
@@ -1477,7 +2104,7 @@ L(\type\()_8tap_filter_2):
         b               4b
 
 480:    // 4x8, 4x16, 4x32 hv
-        vld1.8          {d2},  [\my]
+        vld1.8          {d2},  [\my, :64]
         sub             \src, \src, #1
         sub             \sr2, \src, \s_strd, lsl #1
         sub             \src, \sr2, \s_strd
@@ -1580,7 +2207,7 @@ L(\type\()_8tap_filter_4):
         bgt             880f
         vpush           {q4-q7}
         add             \my,  \my,  #2
-        vld1.8          {d0},  [\mx]
+        vld1.8          {d0},  [\mx, :64]
         vld1.32         {d2[]},  [\my]
         sub             \src,  \src,  #3
         sub             \src,  \src,  \s_strd
@@ -1670,8 +2297,8 @@ L(\type\()_8tap_filter_4):
 640:
 1280:
         vpush           {q4-q7}
-        vld1.8          {d0},  [\mx]
-        vld1.8          {d2},  [\my]
+        vld1.8          {d0},  [\mx, :64]
+        vld1.8          {d2},  [\my, :64]
         sub             \src,  \src,  #3
         sub             \src,  \src,  \s_strd
         sub             \src,  \src,  \s_strd, lsl #1
@@ -2018,6 +2645,7 @@ L(\type\()_bilin_v_tbl):
         // 2x2 v
         vld1.16         {d16[]}, [\src], \s_strd
         bgt             24f
+22:
         vld1.16         {d17[]}, [\sr2], \s_strd
         vld1.16         {d18[]}, [\src], \s_strd
         vext.8          d16, d16, d17, #6
@@ -2028,11 +2656,12 @@ L(\type\()_bilin_v_tbl):
         vst1.16         {d4[0]}, [\dst, :16]
         vst1.16         {d4[1]}, [\ds2, :16]
         pop             {r4-r11,pc}
-24:     // 2x4, 2x8, ... v
+24:     // 2x4, 2x6, 2x8, ... v
         vld1.16         {d17[]}, [\sr2], \s_strd
         vld1.16         {d18[]}, [\src], \s_strd
         vld1.16         {d19[]}, [\sr2], \s_strd
         vld1.16         {d20[]}, [\src], \s_strd
+        sub             \h,  \h,  #4
         vext.8          d16, d16, d17, #6
         vext.8          d17, d17, d18, #6
         vext.8          d18, d18, d19, #6
@@ -2041,14 +2670,15 @@ L(\type\()_bilin_v_tbl):
         vtrn.32         d17, d19
         vmull.u8        q2,  d16, d2
         vmlal.u8        q2,  d17, d3
-        subs            \h,  \h,  #4
+        cmp             \h,  #2
         vqrshrn.u16     d4,  q2,  #4
         vst1.16         {d4[0]}, [\dst, :16], \d_strd
         vst1.16         {d4[1]}, [\ds2, :16], \d_strd
         vst1.16         {d4[2]}, [\dst, :16], \d_strd
         vst1.16         {d4[3]}, [\ds2, :16], \d_strd
-        ble             0f
+        blt             0f
         vmov            d16, d20
+        beq             22b
         b               24b
 0:
         pop             {r4-r11,pc}
@@ -2334,3 +2964,377 @@ endfunc
 
 filter_fn put,  r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, 10
 filter_fn prep, r0, r7, r1, r2, r3, r4, r5, r6, r8, r9, 6
+
+.macro load_filter_ptr src
+        asr             r12, \src, #10
+        add             r12, r11, r12, lsl #3
+.endm
+
+.macro load_filter_coef dst, src, inc
+        add             \src, \src, \inc
+        vld1.8          {\dst}, [r12, :64]
+.endm
+
+.macro load_filter_row dst, src, inc
+        load_filter_ptr \src
+        load_filter_coef \dst, \src, \inc
+.endm
+
+function warp_filter_horz_neon
+        load_filter_ptr r5                  // filter 0
+        vld1.16         {q7}, [r2], r3
+        vmov.i8         q6,  #128
+
+        load_filter_coef d0, r5,  r7        // filter 0
+        load_filter_row d1,  r5,  r7        // filter 1
+        load_filter_row d2,  r5,  r7        // filter 2
+        load_filter_ptr r5                  // filter 3
+        veor            q7,  q7,  q6        // subtract by 128 to allow using vmull
+        load_filter_coef d3, r5,  r7        // filter 3
+        vext.8          d12, d14, d15, #1   // filter 1 pixels
+        vext.8          d13, d14, d15, #2   // filter 2 pixels
+        load_filter_ptr r5                  // filter 4
+        vmull.s8        q2,  d14, d0        // filter 0 output
+        vmull.s8        q3,  d12, d1        // filter 1 output
+        load_filter_coef d0, r5,  r7        // filter 4
+        load_filter_ptr r5                  // filter 5
+        vext.8          d12, d14, d15, #3   // filter 3 pixels
+        vmull.s8        q4,  d13, d2        // filter 2 output
+        vext.8          d13, d14, d15, #4   // filter 4 pixels
+        vpadd.i16       d4,  d4,  d5        // pixel 0 (4x16)
+        vpadd.i16       d5,  d6,  d7        // pixel 1 (4x16)
+        load_filter_coef d1, r5,  r7        // filter 5
+        load_filter_ptr r5                  // filter 6
+        vmull.s8        q5,  d12, d3        // filter 3 output
+        vext.8          d12, d14, d15, #5   // filter 5 pixels
+        vmull.s8        q3,  d13, d0        // filter 4 output
+        load_filter_coef d0, r5,  r7        // filter 6
+        vext.8          d13, d14, d15, #6   // filter 6 pixels
+        load_filter_ptr r5                  // filter 7
+        vpadd.i16       d8,  d8,  d9        // pixel 2 (4x16)
+        vpadd.i16       d9,  d10, d11       // pixel 3 (4x16)
+        vmull.s8        q5,  d12, d1        // filter 5 output
+        load_filter_coef d1, r5,  r7        // filter 7
+        vext.8          d14, d14, d15, #7   // filter 7 pixels
+        vpadd.i16       d6,  d6,  d7        // pixel 4 (4x16)
+        vpadd.i16       d10, d10, d11       // pixel 5 (4x16)
+        vmull.s8        q6,  d13, d0        // filter 6 output
+        vmull.s8        q7,  d14, d1        // filter 7 output
+
+        sub             r5,  r5,  r7, lsl #3
+
+        vpadd.i16       d4,  d4,  d5        // pixel 0,1 (2x16)
+        vpadd.i16       d5,  d8,  d9        // pixel 2,3 (2x16)
+        vpadd.i16       d12, d12, d13       // pixel 6 (4x16)
+        vpadd.i16       d14, d14, d15       // pixel 7 (4x16)
+        vpadd.i16       d6,  d6,  d10       // pixel 4,5 (2x16)
+        vpadd.i16       d10, d12, d14       // pixel 6,7 (2x16)
+        vpadd.i16       d4,  d4,  d5        // pixel 0-3
+        vpadd.i16       d5,  d6,  d10       // pixel 4-7
+
+        add             r5,  r5,  r8
+
+        bx              lr
+endfunc
+
+// void dav1d_warp_affine_8x8_8bpc_neon(
+//         pixel *dst, const ptrdiff_t dst_stride,
+//         const pixel *src, const ptrdiff_t src_stride,
+//         const int16_t *const abcd, int mx, int my)
+.macro warp t, shift
+function warp_affine_8x8\t\()_8bpc_neon, export=1
+        push            {r4-r11,lr}
+        vpush           {q4-q7}
+        ldrd            r4,  r5,  [sp, #100]
+        ldr             r6,  [sp, #108]
+        ldrd            r8,  r9,  [r4]
+        sxth            r7,  r8
+        asr             r8,  r8, #16
+        asr             r4,  r9, #16
+        sxth            r9,  r9
+        mov             r10, #8
+        sub             r2,  r2,  r3, lsl #1
+        sub             r2,  r2,  r3
+        sub             r2,  r2,  #3
+        movrel          r11, X(mc_warp_filter), 64*8
+.ifnb \t
+        lsl             r1,  r1,  #1
+.endif
+        add             r5,  r5,  #512
+        add             r6,  r6,  #512
+
+        bl              warp_filter_horz_neon
+        vrshr.s16       q8,  q2,  #3
+        bl              warp_filter_horz_neon
+        vrshr.s16       q9,  q2,  #3
+        bl              warp_filter_horz_neon
+        vrshr.s16       q10, q2,  #3
+        bl              warp_filter_horz_neon
+        vrshr.s16       q11, q2,  #3
+        bl              warp_filter_horz_neon
+        vrshr.s16       q12, q2,  #3
+        bl              warp_filter_horz_neon
+        vrshr.s16       q13, q2,  #3
+        bl              warp_filter_horz_neon
+        vrshr.s16       q14, q2,  #3
+
+1:
+        bl              warp_filter_horz_neon
+        vrshr.s16       q15, q2,  #3
+
+        load_filter_row d8,  r6,  r9
+        load_filter_row d9,  r6,  r9
+        load_filter_row d10, r6,  r9
+        load_filter_row d11, r6,  r9
+        load_filter_row d12, r6,  r9
+        load_filter_row d13, r6,  r9
+        load_filter_row d14, r6,  r9
+        load_filter_row d15, r6,  r9
+        transpose_8x8b  q4,  q5,  q6,  q7,  d8,  d9,  d10, d11, d12, d13, d14, d15
+        vmovl.s8        q1,  d8
+        vmovl.s8        q2,  d9
+        vmovl.s8        q3,  d10
+        vmovl.s8        q4,  d11
+        vmovl.s8        q5,  d12
+        vmovl.s8        q6,  d13
+
+        sub             r6,  r6,  r9, lsl #3
+
+        // This ordering of vmull/vmlal is highly beneficial for
+        // Cortex A8/A9/A53 here, but harmful for Cortex A7.
+        vmull.s16       q0,  d16,  d2
+        vmlal.s16       q0,  d18,  d4
+        vmlal.s16       q0,  d20,  d6
+        vmlal.s16       q0,  d22,  d8
+        vmlal.s16       q0,  d24,  d10
+        vmlal.s16       q0,  d26,  d12
+        vmull.s16       q1,  d17,  d3
+        vmlal.s16       q1,  d19,  d5
+        vmlal.s16       q1,  d21,  d7
+        vmlal.s16       q1,  d23,  d9
+        vmlal.s16       q1,  d25,  d11
+        vmlal.s16       q1,  d27,  d13
+
+        vmovl.s8        q2,  d14
+        vmovl.s8        q3,  d15
+
+        vmlal.s16       q0,  d28,  d4
+        vmlal.s16       q0,  d30,  d6
+        vmlal.s16       q1,  d29,  d5
+        vmlal.s16       q1,  d31,  d7
+
+.ifb \t
+        vmov.i16        q7,  #128
+.else
+        vmov.i16        q7,  #0x800
+.endif
+
+        vmov            q8,  q9
+        vmov            q9,  q10
+        vqrshrn.s32     d0,  q0,  #\shift
+        vmov            q10, q11
+        vqrshrn.s32     d1,  q1,  #\shift
+        vmov            q11, q12
+        vadd.i16        q0,  q0,  q7
+        vmov            q12, q13
+.ifb \t
+        vqmovun.s16     d0,  q0
+.endif
+        vmov            q13, q14
+        vmov            q14, q15
+        subs            r10, r10, #1
+.ifnb \t
+        vst1.16         {q0}, [r0, :128], r1
+.else
+        vst1.8          {d0}, [r0, :64], r1
+.endif
+
+        add             r6,  r6,  r4
+        bgt             1b
+
+        vpop            {q4-q7}
+        pop             {r4-r11,pc}
+endfunc
+.endm
+
+warp  , 11
+warp t, 7
+
+// void dav1d_emu_edge_8bpc_neon(
+//         const intptr_t bw, const intptr_t bh,
+//         const intptr_t iw, const intptr_t ih,
+//         const intptr_t x, const intptr_t y,
+//         pixel *dst, const ptrdiff_t dst_stride,
+//         const pixel *ref, const ptrdiff_t ref_stride)
+function emu_edge_8bpc_neon, export=1
+        push            {r4-r11,lr}
+        ldrd            r4,  r5,  [sp, #36]
+        ldrd            r6,  r7,  [sp, #44]
+        ldrd            r8,  r9,  [sp, #52]
+
+        // ref += iclip(y, 0, ih - 1) * PXSTRIDE(ref_stride)
+        // ref += iclip(x, 0, iw - 1)
+        sub             r12, r3,  #1           // ih - 1
+        cmp             r5,  r3
+        sub             lr,  r2,  #1           // iw - 1
+        it              lt
+        movlt           r12, r5                // min(y, ih - 1)
+        cmp             r4,  r2
+        bic             r12, r12, r12, asr #31 // max(min(y, ih - 1), 0)
+        it              lt
+        movlt           lr,  r4                // min(x, iw - 1)
+        bic             lr,  lr,  lr,  asr #31 // max(min(x, iw - 1), 0)
+        mla             r8,  r12, r9,  r8      // ref += iclip() * stride
+        add             r8,  r8,  lr           // ref += iclip()
+
+        // bottom_ext = iclip(y + bh - ih, 0, bh - 1)
+        // top_ext = iclip(-y, 0, bh - 1)
+        add             r10, r5,  r1           // y + bh
+        neg             r5,  r5                // -y
+        sub             r10, r10, r3           // y + bh - ih
+        sub             r12, r1,  #1           // bh - 1
+        cmp             r10, r1
+        bic             r5,  r5,  r5,  asr #31 // max(-y, 0)
+        it              ge
+        movge           r10, r12               // min(y + bh - ih, bh-1)
+        cmp             r5,  r1
+        bic             r10, r10, r10, asr #31 // max(min(y + bh - ih, bh-1), 0)
+        it              ge
+        movge           r5,  r12               // min(max(-y, 0), bh-1)
+
+        // right_ext = iclip(x + bw - iw, 0, bw - 1)
+        // left_ext = iclip(-x, 0, bw - 1)
+        add             r11, r4,  r0           // x + bw
+        neg             r4,  r4                // -x
+        sub             r11, r11, r2           // x + bw - iw
+        sub             lr,  r0,  #1           // bw - 1
+        cmp             r11, r0
+        bic             r4,  r4,  r4,  asr #31 // max(-x, 0)
+        it              ge
+        movge           r11, lr                // min(x + bw - iw, bw-1)
+        cmp             r4,  r0
+        bic             r11, r11, r11, asr #31 // max(min(x + bw - iw, bw-1), 0)
+        it              ge
+        movge           r4,  lr                // min(max(-x, 0), bw - 1)
+
+        // center_h = bh - top_ext - bottom_ext
+        // dst += top_ext * PXSTRIDE(dst_stride)
+        // center_w = bw - left_ext - right_ext
+        sub             r1,  r1,  r5           // bh - top_ext
+        mla             r6,  r5,  r7,  r6
+        sub             r2,  r0,  r4           // bw - left_ext
+        sub             r1,  r1,  r10          // center_h = bh - top_ext - bottom_ext
+        sub             r2,  r2,  r11          // center_w = bw - left_ext - right_ext
+
+        mov             r0,  r6                // backup of dst
+
+.macro v_loop need_left, need_right
+0:
+.if \need_left
+        vld1.8          {d0[], d1[]}, [r8]
+        mov             r12, r6                // out = dst
+        mov             r3,  r4
+1:
+        subs            r3,  r3,  #16
+        vst1.8          {q0}, [r12, :128]!
+        bgt             1b
+.endif
+        mov             lr,  r8
+        add             r12, r6,  r4           // out = dst + left_ext
+        mov             r3,  r2
+1:
+        vld1.8          {q0, q1}, [lr]!
+        subs            r3,  r3,  #32
+.if \need_left
+        vst1.8          {q0, q1}, [r12]!
+.else
+        vst1.8          {q0, q1}, [r12, :128]!
+.endif
+        bgt             1b
+.if \need_right
+        add             r3,  r8,  r2           // in + center_w
+        sub             r3,  r3,  #1           // in + center_w - 1
+        add             r12, r6,  r4           // dst + left_ext
+        vld1.8          {d0[], d1[]}, [r3]
+        add             r12, r12, r2           // out = dst + left_ext + center_w
+        mov             r3,  r11
+1:
+        subs            r3,  r3,  #16
+        vst1.8          {q0}, [r12]!
+        bgt             1b
+.endif
+
+        subs            r1,  r1,  #1           // center_h--
+        add             r6,  r6,  r7
+        add             r8,  r8,  r9
+        bgt             0b
+.endm
+
+        cmp             r4,  #0
+        beq             2f
+        // need_left
+        cmp             r11, #0
+        beq             3f
+        // need_left + need_right
+        v_loop          1,   1
+        b               5f
+
+2:
+        // !need_left
+        cmp             r11, #0
+        beq             4f
+        // !need_left + need_right
+        v_loop          0,   1
+        b               5f
+
+3:
+        // need_left + !need_right
+        v_loop          1,   0
+        b               5f
+
+4:
+        // !need_left + !need_right
+        v_loop          0,   0
+
+5:
+        cmp             r10, #0
+        // Storing the original dst in r0 overwrote bw, recalculate it here
+        add             r2,  r2,  r4           // center_w + left_ext
+        add             r2,  r2,  r11          // bw = center_w + left_ext + right_ext
+
+        beq             3f
+        // need_bottom
+        sub             r8,  r6,  r7           // ref = dst - stride
+        mov             r4,  r2
+1:
+        vld1.8          {q0, q1}, [r8, :128]!
+        mov             r3,  r10
+2:
+        subs            r3,  r3,  #1
+        vst1.8          {q0, q1}, [r6, :128], r7
+        bgt             2b
+        mls             r6,  r7,  r10,  r6     // dst -= bottom_ext * stride
+        subs            r4,  r4,  #32          // bw -= 32
+        add             r6,  r6,  #32          // dst += 32
+        bgt             1b
+
+3:
+        cmp             r5,  #0
+        beq             3f
+        // need_top
+        mls             r6,  r7,  r5,  r0      // dst = stored_dst - top_ext * stride
+1:
+        vld1.8          {q0, q1}, [r0, :128]!
+        mov             r3,  r5
+2:
+        subs            r3,  r3,  #1
+        vst1.8          {q0, q1}, [r6, :128], r7
+        bgt             2b
+        mls             r6,  r7,  r5,  r6      // dst -= top_ext * stride
+        subs            r2,  r2,  #32          // bw -= 32
+        add             r6,  r6,  #32          // dst += 32
+        bgt             1b
+
+3:
+        pop             {r4-r11,pc}
+endfunc
